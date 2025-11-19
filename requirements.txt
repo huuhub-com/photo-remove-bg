@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+rembg
+Pillow
+python-multipart
+onnxruntime

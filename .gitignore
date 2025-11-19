@@ -1,0 +1,17 @@
+# Python キャッシュ
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# 仮想環境
+.venv/
+venv/
+env/
+
+# ログ
+*.log
+
+# エディタ系
+.vscode/
+.idea/
