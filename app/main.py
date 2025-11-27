@@ -25,7 +25,7 @@ async def remove_bg(
     file: UploadFile = File(...),
     # ✅ デフォルトは透明PNG（質重視）
     mode: Literal["white", "transparent"] = "white",
-    size: int = 1024,  # white モード用
+    size: int = 1024,  # white モード
 ):
     """
     背景除去 API
