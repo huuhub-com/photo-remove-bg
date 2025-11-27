@@ -1,128 +1,120 @@
 #Deploy
 #gcloud run deploy huuhub-bg-service --source . --region asia-northeast1 --platform managed --service-account=105679435990-compute@developer.gserviceaccount.com --no-allow-unauthenticated --cpu=2 --memory=2Gi --port=8080 --timeout=300
 
+#TEST
+#source .venv/bin/activate
+#uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response
-from rembg import remove, new_session
 from PIL import Image, ImageFilter
 from io import BytesIO
-from typing import Literal
-import os
 
 app = FastAPI()
-#SESSION = new_session()
-SESSION = new_session(model_name="u2net_cloth_seg")
-
-# 入力画像の長辺上限（これより大きいときだけ縮小）
-MAX_SIDE = 4624
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
 
 @app.post("/remove-bg")
 async def remove_bg(
     file: UploadFile = File(...),
-    # ✅ デフォルトは透明PNG（質重視）
-    mode: Literal["white", "transparent"] = "white",
-    size: int = 1024,  # white モード
+    mode: str = "white",   # ★ デフォルトを white に
+    size: int = 1024       # ★ TikTok 用の 1024x1024
 ):
-    """
-    背景除去 API
-    - mode="transparent"  : ほぼ生の解像度のまま、背景だけ透明にして返す（デフォルト）
-    - mode="white"        : 白背景＋size x size にリサイズして返す
-    """
-    if not file.content_type or not file.content_type.startswith("image/"):
+    if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="画像ファイルを送ってください。")
 
-    # 1) 画像読み込み
-    try:
-        raw_bytes = await file.read()
-        img = Image.open(BytesIO(raw_bytes)).convert("RGBA")
-    except Exception:
-        raise HTTPException(status_code=400, detail="画像の読み込みに失敗しました。")
+    raw = await file.read()
+    img = Image.open(BytesIO(raw)).convert("RGBA")
 
-    # 2) 大きすぎる場合だけ縮小（長辺 4624px まで）
     w, h = img.size
-    if max(w, h) > MAX_SIDE:
-        ratio = MAX_SIDE / float(max(w, h))
-        new_w = int(w * ratio)
-        new_h = int(h * ratio)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-        w, h = img.size
-
-    # rembg に bytes で渡す
-    buf_in = BytesIO()
-    img.save(buf_in, format="PNG")
-    input_bytes = buf_in.getvalue()
-
-    # 3) rembg で背景除去
-    try:
-        cutout_bytes = remove(input_bytes, session=SESSION)
-        cutout = Image.open(BytesIO(cutout_bytes)).convert("RGBA")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"背景除去に失敗しました: {e}")
-
-    # 3.5) ★ 境界をカッチリさせる処理（アルファを2値化＋少し膨らませ）
-    r, g, b, a = cutout.split()
-
-    # しきい値 220 以上を完全不透明、未満を完全透明にする
-    # 数値を上げる(230〜240) → よりパキッと / 下げる(200前後) → 多少なめらか
-    THRESHOLD = 220
-    a = a.point(lambda v: 255 if v >= THRESHOLD else 0)
-
-    # マスクを 1 ピクセルぶん膨らませて、輪郭欠けを防ぐ（3x3 の MaxFilter）
-    a = a.filter(ImageFilter.MaxFilter(3))
-    a = a.filter(ImageFilter.MinFilter(3))
-
-    cutout = Image.merge("RGBA", (r, g, b, a))
+    pix = img.load()
 
     # =========================
-    # A. 透明PNGモード（質重視）
+    # 1. クロマキー判定（グリーンバックを透明化）
+    # =========================
+    GREEN_THR = 120
+    GREEN_RATIO = 1.35
+
+    # 中間バッファ（マスク）
+    mask = Image.new("L", (w, h), 0)
+    mask_pix = mask.load()
+
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pix[x, y]
+
+            is_green = (
+                g > GREEN_THR and
+                g > r * GREEN_RATIO and
+                g > b * GREEN_RATIO
+            )
+
+            if is_green:
+                pix[x, y] = (0, 0, 0, 0)
+                mask_pix[x, y] = 0
+            else:
+                pix[x, y] = (r, g, b, 255)
+                mask_pix[x, y] = 255
+
+    # =========================
+    # 2. グリーンスピル除去（縁のシアンっぽい色を弱める）
+    # =========================
+    SPILL_RATIO = 1.05  # どれくらい「G が強かったら」対象にするか
+    G_SCALE     = 0.50  # G をどれだけ削るか（小さいほど強い）
+    RB_SCALE    = 1.15  # R/B をどれだけ持ち上げるか
+
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pix[x, y]
+            if a > 0:
+                if g > r * SPILL_RATIO and g > b * SPILL_RATIO:
+                    new_g = int(g * G_SCALE)
+                    new_r = min(255, int(r * RB_SCALE))
+                    new_b = min(255, int(b * RB_SCALE))
+                    pix[x, y] = (new_r, new_g, new_b, a)
+
+    # =========================
+    # 3. 縁の 1px 収縮（フリンジ削除）
+    # =========================
+    mask = mask.filter(ImageFilter.MinFilter(3))  # もっと削りたければ 5 に
+    mask_pix = mask.load()  # ★ filter 後に load し直すのを忘れない
+
+    # mask を α に反映
+    for y in range(h):
+        for x in range(w):
+            r, g, b, _ = pix[x, y]
+            a = mask_pix[x, y]
+            pix[x, y] = (r, g, b, a)
+
+    # =========================
+    # 4. トリミング（外側の余白をカット）
+    # =========================
+    bbox = img.getbbox()
+    if bbox:
+        img = img.crop(bbox)
+
+    # =========================
+    # 5-A. 透明PNGを返す（確認用・特殊用途）
     # =========================
     if mode == "transparent":
-        buf = BytesIO()
-        cutout.save(buf, format="PNG")
-        buf.seek(0)
-        return Response(content=buf.getvalue(), media_type="image/png")
+        buff = BytesIO()
+        img.save(buff, format="PNG")
+        return Response(buff.getvalue(), media_type="image/png")
 
     # =========================
-    # B. 白背景＋正方形リサイズ
+    # 5-B. 白背景 1024x1024 にレイアウト（TikTok 用）
     # =========================
-    try:
-        size = int(size)
-        if size <= 0 or size > 4096:
-            size = 1024
-    except Exception:
-        size = 1024
+    # ニュートラルホワイト背景（255,255,255）
+    bg = Image.new("RGB", (size, size), (255, 255, 255))
 
-    # 白背景キャンバス
-    background = Image.new("RGB", (size, size), (255, 255, 255))
+    iw, ih = img.size
+    ratio = min(size / iw, size / ih)  # 長辺がちょうど収まるように
+    nw, nh = int(iw * ratio), int(ih * ratio)
 
-    cw, ch = cutout.size
-    # 基本は縮小のみ（拡大するとまたボケるので）
-    ratio = min(1.0, size / float(max(cw, ch)))
-    new_cw = int(cw * ratio)
-    new_ch = int(ch * ratio)
+    resized = img.resize((nw, nh), Image.LANCZOS)
 
-    cutout_resized = cutout.resize((new_cw, new_ch), Image.LANCZOS)
+    # 中央配置
+    offset_x = (size - nw) // 2
+    offset_y = (size - nh) // 2
+    bg.paste(resized, (offset_x, offset_y), resized)
 
-    offset_x = (size - new_cw) // 2
-    offset_y = (size - new_ch) // 2
-
-    background.paste(cutout_resized, (offset_x, offset_y), mask=cutout_resized)
-
-    buf_out = BytesIO()
-    background.save(buf_out, format="PNG")
-    buf_out.seek(0)
-    return Response(content=buf_out.getvalue(), media_type="image/png")
-
-
-# ローカル開発用（Cloud Run では使われない）
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.getenv("PORT", "8080"))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
+    buff = BytesIO()
+    bg.save(buff, format="PNG")
+    return Response(buff.getvalue(), media_type="image/png")
