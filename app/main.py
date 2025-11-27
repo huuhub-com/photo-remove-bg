@@ -1,3 +1,6 @@
+#Deploy
+#gcloud run deploy huuhub-bg-service --source . --region asia-northeast1 --platform managed --service-account=105679435990-compute@developer.gserviceaccount.com --no-allow-unauthenticated --cpu=2 --memory=2Gi --port=8080 --timeout=300
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response
 from rembg import remove, new_session
@@ -7,9 +10,8 @@ from typing import Literal
 import os
 
 app = FastAPI()
-
-# rembg デフォルトモデル（u2net）を使う
-SESSION = new_session()
+#SESSION = new_session()
+SESSION = new_session(model_name="u2net_cloth_seg")
 
 # 入力画像の長辺上限（これより大きいときだけ縮小）
 MAX_SIDE = 4624
@@ -73,6 +75,7 @@ async def remove_bg(
 
     # マスクを 1 ピクセルぶん膨らませて、輪郭欠けを防ぐ（3x3 の MaxFilter）
     a = a.filter(ImageFilter.MaxFilter(3))
+    a = a.filter(ImageFilter.MinFilter(3))
 
     cutout = Image.merge("RGBA", (r, g, b, a))
 
